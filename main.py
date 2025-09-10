@@ -5,9 +5,12 @@ from datetime import datetime, timedelta
 import logging
 import sys
 
+# Режим тестирования (True - загрузка из файлов, False - запросы к API)
+TESTING = True
+
 BASE_URL = "https://int.soccerway.com/v1/english/matches/soccer/from/{}/to/{}/"
 GAME_URL = "https://int.soccerway.com/v1/english/match/soccer/full/{}}/"
-H2H_URL = "https://int.soccerway.com/v2/english/participants/soccer/h2h-comparison/phase/657/r73237/132/r73237/"
+H2H_URL = "https://int.soccerway.com/legacy/v1/english/matches/?h2hIds={}%2C{}&limit=250&onlydetails=true"
 
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -45,6 +48,86 @@ def fetch_matches_data(url):
     except json.JSONDecodeError as e:
         logging.error(f"Ошибка парсинга JSON: {e}")
         return None
+
+
+def fetch_h2h_data(team1_id, team2_id):
+    """Запрос H2H статистики между командами"""
+    if TESTING:
+        # В режиме тестирования загружаем из файла
+        try:
+            with open('h2h.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logging.info(
+                f"Загружена тестовая H2H статистика из файла для команд {team1_id} и {team2_id}")
+            return data
+        except FileNotFoundError:
+            logging.error("Файл h2h.json не найден")
+            return None
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка парсинга тестового H2H JSON: {e}")
+            return None
+    else:
+        # Реальный запрос к API
+        try:
+            h2h_url = H2H_URL.format(team1_id, team2_id)
+            response = requests.get(h2h_url, headers=HEADERS)
+            response.raise_for_status()
+
+            data = response.json()
+            logging.info(
+                f"Получена H2H статистика для команд {team1_id} и {team2_id}")
+            return data
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Ошибка запроса H2H данных: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка парсинга H2H JSON: {e}")
+            return None
+
+
+def parse_h2h_stats(h2h_data, team1_id, team2_id):
+    """Парсинг H2H статистики"""
+    stats = {
+        'h2h_игры_дома': 0,
+        'h2h_побед_дома': 0,
+        'h2h_ничьи': 0,
+        'h2h_побед_гостей': 0
+    }
+
+    if not h2h_data or 'matches' not in h2h_data:
+        return stats
+
+    for match in h2h_data['matches']:
+        teams = match.get('teams', [])
+        if len(teams) < 2:
+            continue
+
+        # Определяем, какая команда играла дома
+        home_team = teams[0]
+        away_team = teams[1]
+
+        home_team_id = home_team.get('id')
+        away_team_id = away_team.get('id')
+
+        # Проверяем, что это матч между нашими командами
+        if (str(home_team_id) == str(team1_id) and str(away_team_id) == str(team2_id)) or \
+           (str(home_team_id) == str(team2_id) and str(away_team_id) == str(team1_id)):
+
+            # Считаем только игры, где первая команда играла дома
+            if str(home_team_id) == str(team1_id):
+                stats['h2h_игры_дома'] += 1
+
+                # Получаем результат
+                winner = match.get('winner', -1)
+                if winner == 0:  # домашняя команда выиграла
+                    stats['h2h_побед_дома'] += 1
+                elif winner == 1:  # гостевая команда выиграла
+                    stats['h2h_побед_гостей'] += 1
+                elif winner == -1:  # ничья
+                    stats['h2h_ничьи'] += 1
+
+    return stats
 
 
 def parse_match_data(data):
@@ -144,6 +227,33 @@ def parse_match_data(data):
                     elif outcome_code == 'AWAY':
                         match_data['Коэфф_П2'] = price
 
+            # Добавляем H2H статистику для первого матча в качестве теста
+            if len(matches) == 0 and len(teams) >= 2:
+                home_team_id = teams[0].get('id')
+                away_team_id = teams[1].get('id')
+
+                if home_team_id and away_team_id:
+                    h2h_data = fetch_h2h_data(home_team_id, away_team_id)
+                    h2h_stats = parse_h2h_stats(
+                        h2h_data, home_team_id, away_team_id)
+                    match_data.update(h2h_stats)
+                else:
+                    # Заполняем пустые значения если нет ID команд
+                    match_data.update({
+                        'h2h_игры_дома': 0,
+                        'h2h_побед_дома': 0,
+                        'h2h_ничьи': 0,
+                        'h2h_побед_гостей': 0
+                    })
+            else:
+                # Для остальных матчей добавляем пустые значения
+                match_data.update({
+                    'h2h_игры_дома': 0,
+                    'h2h_побед_дома': 0,
+                    'h2h_ничьи': 0,
+                    'h2h_побед_гостей': 0
+                })
+
             matches.append(match_data)
 
     logging.info(f"Обработано {len(matches)} матчей")
@@ -242,9 +352,26 @@ def main():
 
         print(f"\nЗапрос данных за период: {from_date[:10]} - {to_date[:10]}")
 
-        # data = fetch_matches_data(url)
+        if TESTING:
+            # В режиме тестирования загружаем данные из файлов
+            try:
+                with open('example.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                logging.info("Загружены тестовые данные из файла example.json")
+            except FileNotFoundError:
+                logging.error("Файл example.json не найден, пробуем h2h.json")
+                try:
+                    with open('h2h.json', 'r', encoding='utf-8') as f:
+                        h2h_example = json.load(f)
 
-        data = None
+                    data = [{'matches': [h2h_example['matches'][0]], 'st_name': 'Test', 'st_code': 'test',
+                             'c_name': 'Test', 'season_info': {'name': 'Test'}, 'phase_info': {'name': 'Test'}}]
+                    logging.info("Загружены тестовые данные из файла h2h.json")
+                except FileNotFoundError:
+                    logging.error("Файлы example.json и h2h.json не найдены")
+                    data = None
+        else:
+            data = fetch_matches_data(url)
 
         if not data:
             logging.error("Не удалось получить данные")
