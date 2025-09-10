@@ -1,10 +1,13 @@
 import requests
 import json
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
+import sys
 
-ALL_GAMES_URL = "https://int.soccerway.com/v1/english/matches/soccer/from/2025-09-09T21:00:00/to/2025-09-10T21:00:00/"
+BASE_URL = "https://int.soccerway.com/v1/english/matches/soccer/from/{}/to/{}/"
+GAME_URL = "https://int.soccerway.com/v1/english/match/soccer/full/{}}/"
+H2H_URL = "https://int.soccerway.com/v2/english/participants/soccer/h2h-comparison/phase/657/r73237/132/r73237/"
 
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -62,7 +65,15 @@ def parse_match_data(data):
         }
 
         for match in tournament.get('matches', []):
+            # Парсинг даты и времени
+            match_datetime = datetime.fromtimestamp(
+                match.get('start', 0)) if match.get('start') else datetime.now()
+
             match_data = {
+                'число': match_datetime.day,
+                'месяц': match_datetime.month,
+                'год': match_datetime.year,
+                'время': match_datetime.strftime('%H:%M'),
                 'Турнир': tournament_info['st_name'],
                 'Код_турнира': tournament_info['st_code'],
                 'Континент': tournament_info['c_name'],
@@ -81,6 +92,10 @@ def parse_match_data(data):
                 away_team = teams[1]
 
                 match_data.update({
+                    'команда 1': home_team.get('name', ''),
+                    'команда 2': away_team.get('name', ''),
+                    'команда1команда2': f"{home_team.get('name', '')}{away_team.get('name', '')}",
+                    'соревнование': tournament_info['st_name'],
                     'Команда_дома': home_team.get('name', ''),
                     'Команда_гостей': away_team.get('name', ''),
                     'Счет_дома': home_team.get('scores', {}).get('FINAL_RESULT', ''),
@@ -153,29 +168,105 @@ def save_to_excel(matches, filename='matches.xlsx'):
         return False
 
 
+def get_date_input():
+    """Получение даты от пользователя через консоль"""
+    print("\n=== Выбор периода для поиска матчей ===")
+
+    while True:
+        print("\nВыберите способ ввода даты:")
+        print("1 - Указать конкретную дату (YYYY-MM-DD)")
+        print("2 - Сегодня")
+        print("3 - Вчера")
+        print("4 - Завтра")
+        print("5 - Указать период (от и до)")
+
+        try:
+            choice = input("\nВведите номер (1-5): ").strip()
+
+            if choice == "1":
+                date_str = input("Введите дату (YYYY-MM-DD): ").strip()
+                selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+                from_date = selected_date.strftime("%Y-%m-%dT21:00:00")
+                to_date = (selected_date + timedelta(days=1)
+                           ).strftime("%Y-%m-%dT21:00:00")
+                return from_date, to_date
+
+            elif choice == "2":
+                today = datetime.now()
+                from_date = today.strftime("%Y-%m-%dT21:00:00")
+                to_date = (today + timedelta(days=1)
+                           ).strftime("%Y-%m-%dT21:00:00")
+                return from_date, to_date
+
+            elif choice == "3":
+                yesterday = datetime.now() - timedelta(days=1)
+                from_date = yesterday.strftime("%Y-%m-%dT21:00:00")
+                to_date = datetime.now().strftime("%Y-%m-%dT21:00:00")
+                return from_date, to_date
+
+            elif choice == "4":
+                tomorrow = datetime.now() + timedelta(days=1)
+                from_date = tomorrow.strftime("%Y-%m-%dT21:00:00")
+                to_date = (tomorrow + timedelta(days=1)
+                           ).strftime("%Y-%m-%dT21:00:00")
+                return from_date, to_date
+
+            elif choice == "5":
+                from_str = input("Введите дату начала (YYYY-MM-DD): ").strip()
+                to_str = input("Введите дату окончания (YYYY-MM-DD): ").strip()
+
+                from_date = datetime.strptime(from_str, "%Y-%m-%d")
+                to_date = datetime.strptime(
+                    to_str, "%Y-%m-%d") + timedelta(days=1)
+
+                return from_date.strftime("%Y-%m-%dT21:00:00"), to_date.strftime("%Y-%m-%dT21:00:00")
+
+            else:
+                print("Ошибка: выберите номер от 1 до 5")
+
+        except ValueError as e:
+            print(f"Ошибка формата даты: {e}")
+            print("Используйте формат YYYY-MM-DD (например, 2025-09-10)")
+        except KeyboardInterrupt:
+            print("\nВыход из программы...")
+            sys.exit(0)
+
+
 def main():
     """Основная функция программы"""
     logging.info("Запуск приложения")
 
-    data = fetch_matches_data(ALL_GAMES_URL)
+    try:
+        from_date, to_date = get_date_input()
+        url = BASE_URL.format(from_date, to_date)
 
-    if not data:
-        logging.error("Не удалось получить данные")
-        return
+        print(f"\nЗапрос данных за период: {from_date[:10]} - {to_date[:10]}")
 
-    matches = parse_match_data(data)
+        # data = fetch_matches_data(url)
 
-    if matches:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"matches_{timestamp}.xlsx"
+        data = None
 
-        if save_to_excel(matches, filename):
-            print(
-                f"Успешно сохранено {len(matches)} матчей в файл: {filename}")
+        if not data:
+            logging.error("Не удалось получить данные")
+            return
+
+        matches = parse_match_data(data)
+
+        if matches:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"matches_{timestamp}.xlsx"
+
+            if save_to_excel(matches, filename):
+                print(
+                    f"Успешно сохранено {len(matches)} матчей в файл: {filename}")
+            else:
+                print("Ошибка при сохранении данных")
         else:
-            print("Ошибка при сохранении данных")
-    else:
-        print("Нет данных для сохранения")
+            print("Нет данных для сохранения")
+
+    except KeyboardInterrupt:
+        print("\nВыход из программы...")
+        sys.exit(0)
 
 
 if __name__ == '__main__':
