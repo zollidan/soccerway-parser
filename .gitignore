@@ -12,3 +12,4 @@ wheels/
 
 # parser output 
 *.xlsx
+*.log

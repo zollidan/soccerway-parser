@@ -6,6 +6,8 @@ import logging
 import sys
 import time
 
+from tqdm import tqdm
+
 # Режим тестирования (True - загрузка из файлов, False - запросы к API)
 TESTING = True
 
@@ -15,7 +17,6 @@ H2H_URL = "https://int.soccerway.com/legacy/v1/english/matches/?h2hIds={}%2C{}&l
 
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
     "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
     "Connection": "keep-alive",
     "Host": "int.soccerway.com",
@@ -29,7 +30,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0"
 }
 
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(filename='app.log', filemode='a', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 H2H_RATE_LIMIT_SECONDS = 1.0  # минимальный интервал между запросами H2H
@@ -67,6 +68,11 @@ def _get_with_retries(url, headers=None, max_retries=H2H_MAX_RETRIES):
                     f"Получен 429 Too Many Requests. Ожидание {wait_s} сек и повтор…")
                 time.sleep(wait_s)
                 attempt += 1
+            elif resp.status_code == 403:
+                logging.warning(
+                    f"Получен 403 Forbidden. Возможна блокировка. Ожидание {delay * 2:.1f} сек и повтор…")
+                time.sleep(delay * 2)  # Увеличенная задержка для 403
+                attempt += 1
             elif 500 <= resp.status_code < 600:
                 logging.warning(
                     f"Серверная ошибка {resp.status_code}. Повтор через {delay:.1f} сек…")
@@ -85,7 +91,7 @@ def _get_with_retries(url, headers=None, max_retries=H2H_MAX_RETRIES):
             logging.error(f"HTTP ошибка: {e}")
             raise
         except json.JSONDecodeError as e:
-            logging.warning(f"Ошибка JSON: {e}. Повтор через {delay:.1f} сек…")
+            logging.warning(f"Ошибка JSON: {e}. URL: {url} Повтор через {delay:.1f} сек…")
             time.sleep(delay)
             attempt += 1
 
@@ -145,7 +151,7 @@ def fetch_h2h_data(team1_id, team2_id):
 
 
 def parse_h2h_stats(h2h_data, team1_id, team2_id):
-    """Парсинг H2H статистики (для обеих команд как хозяев)."""
+    """Парсинг H2H статистики для обеих команд"""
     stats = {
         'h2h_игры_дома_ком1': 0,
         'h2h_побед_дома_ком1': 0,
@@ -160,7 +166,7 @@ def parse_h2h_stats(h2h_data, team1_id, team2_id):
     if not h2h_data or 'matches' not in h2h_data:
         return stats
 
-    for match in h2h_data['matches']:
+    for match in h2h_data['matches'][:15]:
         teams = match.get('teams', [])
         if len(teams) < 2:
             continue
@@ -209,7 +215,7 @@ def parse_match_data(data):
         logging.warning("Нет данных для парсинга")
         return matches
 
-    for tournament in data:
+    for tournament in tqdm(data, desc="Лиги"):
         tournament_info = {
             'st_name': tournament.get('st_name', ''),
             'st_code': tournament.get('st_code', ''),
@@ -218,7 +224,7 @@ def parse_match_data(data):
             'phase_info': tournament.get('phase_info', {}).get('name', '')
         }
 
-        for match in tournament.get('matches', []):
+        for match in tqdm(tournament.get('matches', []), desc="Игры в лиге", leave=False):
             # Парсинг даты и времени
             match_datetime = datetime.fromtimestamp(
                 match.get('start', 0)) if match.get('start') else datetime.now()
@@ -472,7 +478,7 @@ def main():
             logging.error("Нет данных для сохранения")
 
     except KeyboardInterrupt:
-        logging.info("\nВыход из программы...")
+        logging.info("Выход из программы...")
         sys.exit(0)
 
 
