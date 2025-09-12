@@ -1,3 +1,6 @@
+r"""main app module"""
+
+
 import requests
 import json
 import pandas as pd
@@ -8,11 +11,13 @@ import time
 
 from tqdm import tqdm
 
+# TODO: Move configuration to separate config file or environment variables
 # Режим тестирования (True - загрузка из файлов, False - запросы к API)
 TESTING = True
 
 BASE_URL = "https://int.soccerway.com/v1/english/matches/soccer/from/{}/to/{}/"
-GAME_URL = "https://int.soccerway.com/v1/english/match/soccer/full/{}}/"
+# TODO: Fix URL format - extra closing brace
+GAME_URL = "https://int.soccerway.com/v1/english/match/soccer/full/{}/"
 H2H_URL = "https://int.soccerway.com/legacy/v1/english/matches/?h2hIds={}%2C{}&limit=50&onlydetails=true"
 
 HEADERS = {
@@ -30,19 +35,22 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0"
 }
 
-logging.basicConfig(filename='app.log', filemode='a', level=logging.INFO,
+logging.basicConfig(filename='app.log', filemode='a', level=logging.INFO, encoding="utf-8",
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 H2H_RATE_LIMIT_SECONDS = 1.0  # минимальный интервал между запросами H2H
-H2H_MAX_RETRIES = 3           # количество повторов при ошибках/429
+H2H_MAX_RETRIES = 3           # количество повторов при ошибках/429/403
 H2H_BACKOFF_FACTOR = 1.5      # коэффициент экспоненциальной паузы
 
+# TODO: Implement proper cache with expiration and size limits
+# TODO: Consider using Redis or other persistent cache for production
 # Кэш и контроль частоты запросов
 H2H_CACHE = {}
 _last_request_time = 0.0
 _session = requests.Session()
 
 
+# TODO: Move rate limiting logic to a separate class
 def _rate_limit_wait():
     global _last_request_time
     now = time.time()
@@ -52,6 +60,8 @@ def _rate_limit_wait():
     _last_request_time = time.time()
 
 
+# TODO: Add type hints and improve error handling
+# TODO: Consider using exponential backoff with jitter
 def _get_with_retries(url, headers=None, max_retries=H2H_MAX_RETRIES):
     """HTTP GET с ограничением частоты, повторами и обработкой 429/5xx."""
     attempt = 0
@@ -91,7 +101,8 @@ def _get_with_retries(url, headers=None, max_retries=H2H_MAX_RETRIES):
             logging.error(f"HTTP ошибка: {e}")
             raise
         except json.JSONDecodeError as e:
-            logging.warning(f"Ошибка JSON: {e}. URL: {url} Повтор через {delay:.1f} сек…")
+            logging.warning(
+                f"Ошибка JSON: {e}. URL: {url} Повтор через {delay:.1f} сек…")
             time.sleep(delay)
             attempt += 1
 
@@ -166,7 +177,7 @@ def parse_h2h_stats(h2h_data, team1_id, team2_id):
     if not h2h_data or 'matches' not in h2h_data:
         return stats
 
-    for match in h2h_data['matches'][:15]:
+    for match in h2h_data['matches']:  # remove for testing [:15]
         teams = match.get('teams', [])
         if len(teams) < 2:
             continue
@@ -183,7 +194,8 @@ def parse_h2h_stats(h2h_data, team1_id, team2_id):
 
             winner = match.get('winner', -1)
 
-            # FIXME: непраильный подсчет победа ничья
+            # FIXME: неправильный подсчет победа ничья - исправить логику подсчета результатов
+            # TODO: Add unit tests for H2H statistics calculation
             # Статистика, когда команда 1 играла дома
             if str(home_team_id) == str(team1_id):
                 stats['h2h_игры_дома_ком1'] += 1
@@ -207,6 +219,9 @@ def parse_h2h_stats(h2h_data, team1_id, team2_id):
     return stats
 
 
+# TODO: Refactor this large function into smaller, more focused functions
+# TODO: Add data validation and schema checking
+# TODO: Implement proper error recovery for malformed data
 def parse_match_data(data):
     """Парсинг данных матчей из полученного JSON"""
     matches = []
@@ -225,6 +240,8 @@ def parse_match_data(data):
         }
 
         for match in tqdm(tournament.get('matches', []), desc="Игры в лиге", leave=False):
+            # TODO: Handle timezone conversion properly
+            # TODO: Add validation for timestamp values
             # Парсинг даты и времени
             match_datetime = datetime.fromtimestamp(
                 match.get('start', 0)) if match.get('start') else datetime.now()
@@ -304,6 +321,8 @@ def parse_match_data(data):
                     elif outcome_code == 'AWAY':
                         match_data['Коэфф_П2'] = price
 
+            # TODO: Optimize H2H data fetching - avoid redundant API calls
+            # TODO: Implement bulk H2H data fetching for better performance
             # Добавляем H2H статистику для каждого матча с защитой и кэшем
             if len(teams) >= 2:
                 home_team_id = teams[0].get('id')
@@ -316,10 +335,10 @@ def parse_match_data(data):
                         match_data.update(h2h_stats)
                     else:
                         match_data.update({
-                            'h2h_игры_дома': 0,
-                            'h2h_побед_дома': 0,
-                            'h2h_ничьи': 0,
-                            'h2h_побед_гостей': 0,
+                            'h2h_игры_дома_ком1': 0,
+                            'h2h_побед_дома_ком1': 0,
+                            'h2h_ничьи_ком1': 0,
+                            'h2h_побед_гостей_ком1': 0,
                             'h2h_игры_дома_ком2': 0,
                             'h2h_побед_дома_ком2': 0,
                             'h2h_ничьи_ком2': 0,
@@ -328,12 +347,14 @@ def parse_match_data(data):
                 except Exception as e:
                     logging.warning(
                         f"Не удалось получить H2H для матча {match.get('id')}: {e}")
+                    # TODO: Consider alternative strategies for missing H2H data
+                    # TODO: Log which matches failed H2H data retrieval for debugging
                     # Заполняем нулями при ошибках — сохраняем максимум данных
                     match_data.update({
-                        'h2h_игры_дома': 0,
-                        'h2h_побед_дома': 0,
-                        'h2h_ничьи': 0,
-                        'h2h_побед_гостей': 0,
+                        'h2h_игры_дома_ком1': 0,
+                        'h2h_побед_дома_ком1': 0,
+                        'h2h_ничьи_ком1': 0,
+                        'h2h_побед_гостей_ком1': 0,
                         'h2h_игры_дома_ком2': 0,
                         'h2h_побед_дома_ком2': 0,
                         'h2h_ничьи_ком2': 0,
@@ -346,6 +367,9 @@ def parse_match_data(data):
     return matches
 
 
+# TODO: Add support for other export formats (CSV, JSON, etc.)
+# TODO: Add data validation before export
+# TODO: Implement incremental/append mode for large datasets
 def save_to_excel(matches, filename='matches.xlsx'):
     """Сохранение данных в Excel файл"""
     try:
@@ -364,6 +388,9 @@ def save_to_excel(matches, filename='matches.xlsx'):
         return False
 
 
+# TODO: Add support for command line arguments
+# TODO: Implement CLI version
+# TODO: Add date range validation
 def get_date_input():
     """Получение даты от пользователя через консоль"""
     print("\n=== Выбор периода для поиска матчей ===")
@@ -375,50 +402,58 @@ def get_date_input():
         print("3 - Вчера")
         print("4 - Завтра")
         print("5 - Указать период (от и до)")
+        print("6 - Выход")
 
         try:
-            choice = input("\nВведите номер (1-5): ").strip()
+            choice = input("\nВведите номер (1-6): ").strip()
+            now = datetime.now()
 
-            if choice == "1":
-                date_str = input("Введите дату (YYYY-MM-DD): ").strip()
-                selected_date = datetime.strptime(date_str, "%Y-%m-%d")
-                from_date = selected_date.strftime("%Y-%m-%dT21:00:00")
-                to_date = (selected_date + timedelta(days=1)
-                           ).strftime("%Y-%m-%dT21:00:00")
-                return from_date, to_date
+            match choice:
+                case "1":
+                    date_str = input("Введите дату (YYYY-MM-DD): ").strip()
+                    selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+                    from_date = selected_date.strftime("%Y-%m-%dT00:00:00")
+                    to_date = (selected_date + timedelta(days=1)
+                               ).strftime("%Y-%m-%dT00:00:00")
+                    return from_date, to_date
 
-            elif choice == "2":
-                today = datetime.now()
-                from_date = today.strftime("%Y-%m-%dT21:00:00")
-                to_date = (today + timedelta(days=1)
-                           ).strftime("%Y-%m-%dT21:00:00")
-                return from_date, to_date
+                case "2":
+                    today = now
+                    from_date = today.strftime("%Y-%m-%dT00:00:00")
+                    to_date = (today + timedelta(days=1)
+                               ).strftime("%Y-%m-%dT00:00:00")
+                    return from_date, to_date
 
-            elif choice == "3":
-                yesterday = datetime.now() - timedelta(days=1)
-                from_date = yesterday.strftime("%Y-%m-%dT21:00:00")
-                to_date = datetime.now().strftime("%Y-%m-%dT21:00:00")
-                return from_date, to_date
+                case "3":
+                    yesterday = now - timedelta(days=1)
+                    from_date = yesterday.strftime("%Y-%m-%dT00:00:00")
+                    to_date = now.strftime("%Y-%m-%dT00:00:00")
+                    return from_date, to_date
 
-            elif choice == "4":
-                tomorrow = datetime.now() + timedelta(days=1)
-                from_date = tomorrow.strftime("%Y-%m-%dT21:00:00")
-                to_date = (tomorrow + timedelta(days=1)
-                           ).strftime("%Y-%m-%dT21:00:00")
-                return from_date, to_date
+                case "4":
+                    tomorrow = now + timedelta(days=1)
+                    from_date = tomorrow.strftime("%Y-%m-%dT00:00:00")
+                    to_date = (tomorrow + timedelta(days=1)
+                               ).strftime("%Y-%m-%dT00:00:00")
+                    return from_date, to_date
 
-            elif choice == "5":
-                from_str = input("Введите дату начала (YYYY-MM-DD): ").strip()
-                to_str = input("Введите дату окончания (YYYY-MM-DD): ").strip()
+                case "5":
+                    from_str = input(
+                        "Введите дату начала (YYYY-MM-DD): ").strip()
+                    to_str = input(
+                        "Введите дату окончания (YYYY-MM-DD): ").strip()
+                    from_date = datetime.strptime(from_str, "%Y-%m-%d")
+                    to_date = datetime.strptime(
+                        to_str, "%Y-%m-%d") + timedelta(days=1)
+                    return (from_date.strftime("%Y-%m-%dT00:00:00"),
+                            to_date.strftime("%Y-%m-%dT00:00:00"))
+                case "6":
+                    print("Выход из программы...")
+                    logging.info("Selected exit app...")
+                    sys.exit(0)
 
-                from_date = datetime.strptime(from_str, "%Y-%m-%d")
-                to_date = datetime.strptime(
-                    to_str, "%Y-%m-%d") + timedelta(days=1)
-
-                return from_date.strftime("%Y-%m-%dT21:00:00"), to_date.strftime("%Y-%m-%dT21:00:00")
-
-            else:
-                print("Ошибка: выберите номер от 1 до 5")
+                case _:
+                    print("Ошибка: выберите номер от 1 до 5")
 
         except ValueError as e:
             print(f"Ошибка формата даты: {e}")
@@ -428,6 +463,10 @@ def get_date_input():
             sys.exit(0)
 
 
+# TODO: Refactor main function - too many responsibilities
+# TODO: Add proper configuration management
+# TODO: Implement progress tracking and resume capability
+# TODO: Add command line interface with argparse
 def main():
     """Основная функция программы"""
     logging.info("Запуск приложения")
@@ -438,6 +477,8 @@ def main():
 
         print(f"\nЗапрос данных за период: {from_date[:10]} - {to_date[:10]}")
 
+        # TODO: Implement better test data management
+        # TODO: Add data mocking instead of relying on static files
         if TESTING:
             # В режиме тестирования загружаем данные из файлов
             try:
@@ -450,6 +491,7 @@ def main():
                     with open('h2h.json', 'r', encoding='utf-8') as f:
                         h2h_example = json.load(f)
 
+                    # TODO: Create proper test data structure instead of hardcoded values
                     data = [{'matches': [h2h_example['matches'][0]], 'st_name': 'Test', 'st_code': 'test',
                              'c_name': 'Test', 'season_info': {'name': 'Test'}, 'phase_info': {'name': 'Test'}}]
                     logging.info("Загружены тестовые данные из файла h2h.json")
@@ -478,9 +520,32 @@ def main():
             logging.error("Нет данных для сохранения")
 
     except KeyboardInterrupt:
+
+        # TODO: Implement graceful shutdown - save partial results when interrupted
+        # TODO: Add progress persistence to resume from interruption point
+        # while True:
+        #     print("Ручная остановка программы. Сохранить уже собранные данные?")
+        #     print("1 - Сохранить")
+        #     print("2 - Выйти")
+        #     try:
+        #         choice = input("\nВведите номер (1-2): ").strip()
+
+        #         match choice:
+        #             case "1":
+        #                 pass
+        #             case "2":
+        #                 pass
+        #             case _:
+        #                 print("Ошибка: выберите номер от 1 до 2")
+
+        #     except Exception as e:
+        #         logging.error(e)
+
         logging.info("Выход из программы...")
         sys.exit(0)
 
 
+# TODO: Add proper entry point with argument parsing
+# TODO: Consider using click or typer for better CLI experience
 if __name__ == '__main__':
     main()
