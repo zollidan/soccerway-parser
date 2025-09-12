@@ -2,7 +2,7 @@
 Unit tests for H2H data fetching functionality
 """
 import pytest
-from unittest.mock import patch, mock_open, MagicMock
+from unittest.mock import patch, mock_open
 import json
 from main import fetch_h2h_data, H2H_CACHE
 

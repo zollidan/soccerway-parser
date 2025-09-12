@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# cache 
+.pytest_cache
+.ruff_cache
 
 # parser output 
 *.xlsx

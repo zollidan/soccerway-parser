@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import logging
 import sys
 import time
+import asyncio
+import aiohttp
 
 from tqdm import tqdm
 
@@ -117,7 +119,7 @@ def fetch_matches_data(url):
         response.raise_for_status()
 
         data = response.json()
-        logging.info(f"Успешно получены данные с API")
+        logging.info("Успешно получены данные с API")
         return data
 
     except requests.exceptions.RequestException as e:
@@ -161,6 +163,165 @@ def fetch_h2h_data(team1_id, team2_id):
             return None
 
 
+async def fetch_h2h_data_async(session, team1_id, team2_id, semaphore):
+    """Асинхронный запрос H2H статистики между двумя командами с кэшем и повторами."""
+    key = tuple(sorted([str(team1_id), str(team2_id)]))
+    if key in H2H_CACHE:
+        return H2H_CACHE[key]
+
+    if TESTING:
+        try:
+            with open('h2h.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logging.info(
+                f"Загружена тестовая H2H статистика из файла для команд {team1_id} и {team2_id}")
+            H2H_CACHE[key] = data
+            return data
+        except FileNotFoundError:
+            logging.error("Файл h2h.json не найден")
+            return None
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка парсинга тестового H2H JSON: {e}")
+            return None
+    else:
+        async with semaphore:
+            try:
+                h2h_url = H2H_URL.format(team1_id, team2_id)
+                await asyncio.sleep(H2H_RATE_LIMIT_SECONDS)  # Rate limiting
+
+                async with session.get(h2h_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+
+                logging.info(
+                    f"Получена H2H статистика для команд {team1_id} и {team2_id}")
+                H2H_CACHE[key] = data
+                return data
+            except Exception as e:
+                logging.error(f"Ошибка получения H2H: {e}")
+                return None
+
+
+async def process_single_match(session, match, tournament_info, semaphore):
+    """Асинхронная обработка одного матча с получением H2H данных"""
+    # Парсинг даты и времени
+    match_datetime = datetime.fromtimestamp(
+        match.get('start', 0)) if match.get('start') else datetime.now()
+
+    match_data = {
+        'число': match_datetime.day,
+        'месяц': match_datetime.month,
+        'год': match_datetime.year,
+        'время': match_datetime.strftime('%H:%M'),
+        'Турнир': tournament_info['st_name'],
+        'Код_турнира': tournament_info['st_code'],
+        'Континент': tournament_info['c_name'],
+        'Сезон': tournament_info['season_info'],
+        'Фаза': tournament_info['phase_info'],
+        'ID_матча': match.get('id', ''),
+        'Статус': match.get('status', ''),
+        'Дата_время': datetime.fromtimestamp(match.get('start', 0)).strftime('%Y-%m-%d %H:%M:%S') if match.get('start') else '',
+        'Тур': match.get('round', ''),
+        'Длительность': f"{match.get('elapsed', '')} {match.get('elapsed_t', '').lower()}",
+    }
+
+    teams = match.get('teams', [])
+    if len(teams) >= 2:
+        home_team = teams[0]
+        away_team = teams[1]
+
+        match_data.update({
+            'команда 1': home_team.get('name', ''),
+            'команда 2': away_team.get('name', ''),
+            'команда1команда2': f"{home_team.get('name', '')}{away_team.get('name', '')}",
+            'соревнование': tournament_info['st_name'],
+            'Команда_дома': home_team.get('name', ''),
+            'Команда_гостей': away_team.get('name', ''),
+            'Счет_дома': home_team.get('scores', {}).get('FINAL_RESULT', ''),
+            'Счет_гостей': away_team.get('scores', {}).get('FINAL_RESULT', ''),
+            'Счет_1тайм_дома': home_team.get('scores', {}).get('HALF_TIME', ''),
+            'Счет_1тайм_гостей': away_team.get('scores', {}).get('HALF_TIME', ''),
+        })
+
+        home_stats = home_team.get('stats', {})
+        away_stats = away_team.get('stats', {})
+
+        match_data.update({
+            'Желтые_карты_дома': home_stats.get('YELLOW_CARD', 0),
+            'Желтые_карты_гостей': away_stats.get('YELLOW_CARD', 0),
+            'Красные_карты_дома': home_stats.get('RED_CARD', 0),
+            'Красные_карты_гостей': away_stats.get('RED_CARD', 0),
+            'Угловые_дома': home_stats.get('CORNER_KICK', 0),
+            'Угловые_гостей': away_stats.get('CORNER_KICK', 0),
+            'Замены_дома': home_stats.get('SUBSTITUTION', 0),
+            'Замены_гостей': away_stats.get('SUBSTITUTION', 0),
+        })
+
+        home_form = home_team.get('form_o', {})
+        away_form = away_team.get('form_o', {})
+
+        match_data.update({
+            'Форма_дома_ppg': home_form.get('avg_ppg', 0),
+            'Форма_гостей_ppg': away_form.get('avg_ppg', 0),
+        })
+
+    odds = match.get('odds', [])
+    if odds:
+        bookmaker = odds[0].get('bookmaker', {})
+        values = odds[0].get('values', [])
+
+        match_data['Букмекер'] = bookmaker.get('name', '')
+
+        for value in values:
+            outcome_code = value.get('outcome', {}).get('code', '')
+            price = value.get('price', {}).get('decimal', '')
+
+            if outcome_code == 'HOME':
+                match_data['Коэфф_П1'] = price
+            elif outcome_code == 'DRAW':
+                match_data['Коэфф_X'] = price
+            elif outcome_code == 'AWAY':
+                match_data['Коэфф_П2'] = price
+
+    # Добавляем H2H статистику для каждого матча с защитой и кэшем
+    if len(teams) >= 2:
+        home_team_id = teams[0].get('id')
+        away_team_id = teams[1].get('id')
+        try:
+            if home_team_id and away_team_id:
+                h2h_data = await fetch_h2h_data_async(session, home_team_id, away_team_id, semaphore)
+                h2h_stats = parse_h2h_stats(
+                    h2h_data, home_team_id, away_team_id)
+                match_data.update(h2h_stats)
+            else:
+                match_data.update({
+                    'h2h_игры_дома_ком1': 0,
+                    'h2h_побед_дома_ком1': 0,
+                    'h2h_ничьи_ком1': 0,
+                    'h2h_побед_гостей_ком1': 0,
+                    'h2h_игры_дома_ком2': 0,
+                    'h2h_побед_дома_ком2': 0,
+                    'h2h_ничьи_ком2': 0,
+                    'h2h_побед_гостей_ком2': 0,
+                })
+        except Exception as e:
+            logging.warning(
+                f"Не удалось получить H2H для матча {match.get('id')}: {e}")
+            # Заполняем нулями при ошибках — сохраняем максимум данных
+            match_data.update({
+                'h2h_игры_дома_ком1': 0,
+                'h2h_побед_дома_ком1': 0,
+                'h2h_ничьи_ком1': 0,
+                'h2h_побед_гостей_ком1': 0,
+                'h2h_игры_дома_ком2': 0,
+                'h2h_побед_дома_ком2': 0,
+                'h2h_ничьи_ком2': 0,
+                'h2h_побед_гостей_ком2': 0,
+            })
+
+    return match_data
+
+
 def parse_h2h_stats(h2h_data, team1_id, team2_id):
     """Парсинг H2H статистики для обеих команд"""
     stats = {
@@ -189,6 +350,7 @@ def parse_h2h_stats(h2h_data, team1_id, team2_id):
         away_team_id = away_team.get('id')
 
         # Учитываем только личные встречи этих двух команд
+        # FIXME: В этом наборе данных и так только личные встречи. Проверить и удалить
         if (str(home_team_id) == str(team1_id) and str(away_team_id) == str(team2_id)) or \
            (str(home_team_id) == str(team2_id) and str(away_team_id) == str(team1_id)):
 
@@ -222,149 +384,54 @@ def parse_h2h_stats(h2h_data, team1_id, team2_id):
 # TODO: Refactor this large function into smaller, more focused functions
 # TODO: Add data validation and schema checking
 # TODO: Implement proper error recovery for malformed data
-def parse_match_data(data):
-    """Парсинг данных матчей из полученного JSON"""
+async def parse_match_data_async(data):
+    """Асинхронный парсинг данных матчей из полученного JSON с ограничением до 30 одновременных запросов"""
     matches = []
 
     if not data or not isinstance(data, list):
         logging.warning("Нет данных для парсинга")
         return matches
 
-    for tournament in tqdm(data, desc="Лиги"):
-        tournament_info = {
-            'st_name': tournament.get('st_name', ''),
-            'st_code': tournament.get('st_code', ''),
-            'c_name': tournament.get('c_name', ''),
-            'season_info': tournament.get('season_info', {}).get('name', ''),
-            'phase_info': tournament.get('phase_info', {}).get('name', '')
-        }
+    # Семафор для ограничения количества одновременных запросов до 30
+    semaphore = asyncio.Semaphore(30)
 
-        for match in tqdm(tournament.get('matches', []), desc="Игры в лиге", leave=False):
-            # TODO: Handle timezone conversion properly
-            # TODO: Add validation for timestamp values
-            # Парсинг даты и времени
-            match_datetime = datetime.fromtimestamp(
-                match.get('start', 0)) if match.get('start') else datetime.now()
-
-            match_data = {
-                'число': match_datetime.day,
-                'месяц': match_datetime.month,
-                'год': match_datetime.year,
-                'время': match_datetime.strftime('%H:%M'),
-                'Турнир': tournament_info['st_name'],
-                'Код_турнира': tournament_info['st_code'],
-                'Континент': tournament_info['c_name'],
-                'Сезон': tournament_info['season_info'],
-                'Фаза': tournament_info['phase_info'],
-                'ID_матча': match.get('id', ''),
-                'Статус': match.get('status', ''),
-                'Дата_время': datetime.fromtimestamp(match.get('start', 0)).strftime('%Y-%m-%d %H:%M:%S') if match.get('start') else '',
-                'Тур': match.get('round', ''),
-                'Длительность': f"{match.get('elapsed', '')} {match.get('elapsed_t', '').lower()}",
+    async with aiohttp.ClientSession() as session:
+        for tournament in tqdm(data, desc="Лиги"):
+            tournament_info = {
+                'st_name': tournament.get('st_name', ''),
+                'st_code': tournament.get('st_code', ''),
+                'c_name': tournament.get('c_name', ''),
+                'season_info': tournament.get('season_info', {}).get('name', ''),
+                'phase_info': tournament.get('phase_info', {}).get('name', '')
             }
 
-            teams = match.get('teams', [])
-            if len(teams) >= 2:
-                home_team = teams[0]
-                away_team = teams[1]
+            # Создаем задачи для всех матчей в турнире
+            tournament_matches = tournament.get('matches', [])
+            if tournament_matches:
+                tasks = [
+                    process_single_match(
+                        session, match, tournament_info, semaphore)
+                    for match in tournament_matches
+                ]
 
-                match_data.update({
-                    'команда 1': home_team.get('name', ''),
-                    'команда 2': away_team.get('name', ''),
-                    'команда1команда2': f"{home_team.get('name', '')}{away_team.get('name', '')}",
-                    'соревнование': tournament_info['st_name'],
-                    'Команда_дома': home_team.get('name', ''),
-                    'Команда_гостей': away_team.get('name', ''),
-                    'Счет_дома': home_team.get('scores', {}).get('FINAL_RESULT', ''),
-                    'Счет_гостей': away_team.get('scores', {}).get('FINAL_RESULT', ''),
-                    'Счет_1тайм_дома': home_team.get('scores', {}).get('HALF_TIME', ''),
-                    'Счет_1тайм_гостей': away_team.get('scores', {}).get('HALF_TIME', ''),
-                })
+                # Выполняем все задачи параллельно с прогресс-баром
+                tournament_results = []
+                for task in tqdm(asyncio.as_completed(tasks),
+                                 total=len(tasks),
+                                 desc=f"Обработка {tournament_info['st_name']}",
+                                 leave=False):
+                    result = await task
+                    tournament_results.append(result)
 
-                home_stats = home_team.get('stats', {})
-                away_stats = away_team.get('stats', {})
-
-                match_data.update({
-                    'Желтые_карты_дома': home_stats.get('YELLOW_CARD', 0),
-                    'Желтые_карты_гостей': away_stats.get('YELLOW_CARD', 0),
-                    'Красные_карты_дома': home_stats.get('RED_CARD', 0),
-                    'Красные_карты_гостей': away_stats.get('RED_CARD', 0),
-                    'Угловые_дома': home_stats.get('CORNER_KICK', 0),
-                    'Угловые_гостей': away_stats.get('CORNER_KICK', 0),
-                    'Замены_дома': home_stats.get('SUBSTITUTION', 0),
-                    'Замены_гостей': away_stats.get('SUBSTITUTION', 0),
-                })
-
-                home_form = home_team.get('form_o', {})
-                away_form = away_team.get('form_o', {})
-
-                match_data.update({
-                    'Форма_дома_ppg': home_form.get('avg_ppg', 0),
-                    'Форма_гостей_ppg': away_form.get('avg_ppg', 0),
-                })
-
-            odds = match.get('odds', [])
-            if odds:
-                bookmaker = odds[0].get('bookmaker', {})
-                values = odds[0].get('values', [])
-
-                match_data['Букмекер'] = bookmaker.get('name', '')
-
-                for value in values:
-                    outcome_code = value.get('outcome', {}).get('code', '')
-                    price = value.get('price', {}).get('decimal', '')
-
-                    if outcome_code == 'HOME':
-                        match_data['Коэфф_П1'] = price
-                    elif outcome_code == 'DRAW':
-                        match_data['Коэфф_X'] = price
-                    elif outcome_code == 'AWAY':
-                        match_data['Коэфф_П2'] = price
-
-            # TODO: Optimize H2H data fetching - avoid redundant API calls
-            # TODO: Implement bulk H2H data fetching for better performance
-            # Добавляем H2H статистику для каждого матча с защитой и кэшем
-            if len(teams) >= 2:
-                home_team_id = teams[0].get('id')
-                away_team_id = teams[1].get('id')
-                try:
-                    if home_team_id and away_team_id:
-                        h2h_data = fetch_h2h_data(home_team_id, away_team_id)
-                        h2h_stats = parse_h2h_stats(
-                            h2h_data, home_team_id, away_team_id)
-                        match_data.update(h2h_stats)
-                    else:
-                        match_data.update({
-                            'h2h_игры_дома_ком1': 0,
-                            'h2h_побед_дома_ком1': 0,
-                            'h2h_ничьи_ком1': 0,
-                            'h2h_побед_гостей_ком1': 0,
-                            'h2h_игры_дома_ком2': 0,
-                            'h2h_побед_дома_ком2': 0,
-                            'h2h_ничьи_ком2': 0,
-                            'h2h_побед_гостей_ком2': 0,
-                        })
-                except Exception as e:
-                    logging.warning(
-                        f"Не удалось получить H2H для матча {match.get('id')}: {e}")
-                    # TODO: Consider alternative strategies for missing H2H data
-                    # TODO: Log which matches failed H2H data retrieval for debugging
-                    # Заполняем нулями при ошибках — сохраняем максимум данных
-                    match_data.update({
-                        'h2h_игры_дома_ком1': 0,
-                        'h2h_побед_дома_ком1': 0,
-                        'h2h_ничьи_ком1': 0,
-                        'h2h_побед_гостей_ком1': 0,
-                        'h2h_игры_дома_ком2': 0,
-                        'h2h_побед_дома_ком2': 0,
-                        'h2h_ничьи_ком2': 0,
-                        'h2h_побед_гостей_ком2': 0,
-                    })
-
-            matches.append(match_data)
+                matches.extend(tournament_results)
 
     logging.info(f"Обработано {len(matches)} матчей")
     return matches
+
+
+def parse_match_data(data):
+    """Синхронная обёртка для асинхронного парсинга данных матчей"""
+    return asyncio.run(parse_match_data_async(data))
 
 
 # TODO: Add support for other export formats (CSV, JSON, etc.)
